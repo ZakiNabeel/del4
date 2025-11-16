@@ -28,10 +28,10 @@ $(shell mkdir -p $(BUILD) $(OUTPUT)/cpu/frames $(OUTPUT)/gpu/frames)
 ######################################################################
 # Flags
 ######################################################################
-FLAG1 = -DNDEBUG
+FLAG1 = 
 CPU_CFLAGS = $(FLAG1) -I$(CPU_INCLUDE) -O3
-GPU_CFLAGS = $(FLAG1) -I$(GPU_INCLUDE) -O3
-ACC_FLAGS = -acc -gpu=managed -Minfo=accel -O3 -I$(GPU_INCLUDE) $(FLAG1)
+GPU_CFLAGS = $(FLAG1) -I$(GPU_INCLUDE) -O1
+ACC_FLAGS = -acc -Minfo=accel -O3 -I$(GPU_INCLUDE) $(FLAG1) -fPIC
 
 LIB = -L/usr/local/lib -L/usr/lib
 
@@ -143,22 +143,22 @@ $(BUILD)/gpu_klt_util.o: $(GPU_SRC_CORE)/klt_util.c
 	$(NVC) -c $(GPU_CFLAGS) $< -o $@
 
 $(BUILD)/gpu_selectGoodFeatures.o: $(GPU_SRC_FEATURES)/selectGoodFeatures.c
-	$(NVC) -c $(GPU_CFLAGS) $< -o $@
+	$(NVC) -c $(ACC_FLAGS) $< -o $@
 
 $(BUILD)/gpu_storeFeatures.o: $(GPU_SRC_FEATURES)/storeFeatures.c
-	$(NVC) -c $(GPU_CFLAGS) $< -o $@
+	$(NVC) -c -O1 -Igpu/include $< -o $@
 
 $(BUILD)/gpu_trackFeatures.o: $(GPU_SRC_FEATURES)/trackFeatures.c
-	$(NVC) -c $(GPU_CFLAGS) $< -o $@
+	$(NVC) -c -O1 -Igpu/include $< -o $@
 
 $(BUILD)/gpu_writeFeatures.o: $(GPU_SRC_FEATURES)/writeFeatures.c
-	$(NVC) -c $(GPU_CFLAGS) $< -o $@
+	$(NVC) -c -O1 -Igpu/include $< -o $@
 
 $(BUILD)/gpu_error.o: $(GPU_SRC_IO)/error.c
-	$(NVC) -c $(GPU_CFLAGS) $< -o $@
+	$(NVC) -c -O1 -Igpu/include $< -o $@
 
 $(BUILD)/gpu_pnmio.o: $(GPU_SRC_IO)/pnmio.c
-	$(NVC) -c $(GPU_CFLAGS) $< -o $@
+	$(NVC) -c -O1 -Igpu/include $< -o $@
 
 # GPU library
 libklt_gpu.a: $(GPU_OBJS)
@@ -166,9 +166,9 @@ libklt_gpu.a: $(GPU_OBJS)
 	ar ruv $@ $(GPU_OBJS)
 	@echo "✅ GPU Library built: libklt_gpu.a"
 
-# GPU executable
+# GPU executable - use NVC for linking to get OpenACC runtime
 main_gpu: libklt_gpu.a $(EXAMPLES)/main_gpu.c
-	$(NVC) $(ACC_FLAGS) -DDATA_DIR='"$(DATA_DIR)/"' -DOUTPUT_DIR='"$(OUTPUT)/gpu/frames/"' \
+	$(NVC) -acc -O3 -Igpu/include -DDATA_DIR='"$(DATA_DIR)/"' -DOUTPUT_DIR='"$(OUTPUT)/gpu/frames/"' \
 		-o $@ $(EXAMPLES)/main_gpu.c -L. -lklt_gpu $(LIB) -lm
 	@echo "✅ GPU executable built: main_gpu"
 
