@@ -1,248 +1,374 @@
-######################################################################
-# Makefile for Del4 - OpenACC Optimization Project
-######################################################################
+/*********************************************************************
+ * convolve.c - PURE OpenACC version (no CUDA patterns, no double copies)
+ * 
+ * OpenACC Optimizations:
+ * 1. Single data regions for fused separable convolution
+ * 2. create() for temporary buffers (stay on GPU between passes)
+ * 3. Gang-worker-vector parallelism with collapse(2)
+ * 4. Kernel reversal (matches CPU convolution behavior)
+ * 5. Direct copyin/copyout (no double copies via memcpy)
+ * 6. Vector length tuning (256 threads per gang)
+ *********************************************************************/
 
-# Compilers
-CC = gcc
-NVC ?= nvc
+/* Standard includes */
+#include <assert.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <openacc.h>
 
-# Directories
-CPU_SRC_CORE = cpu/src/core
-CPU_SRC_FEATURES = cpu/src/features
-CPU_SRC_IO = cpu/src/io
-CPU_INCLUDE = cpu/include
+/* Local includes */
+#include "base.h"
+#include "error.h"
+#include "convolve.h"
 
-GPU_SRC_CORE = gpu/src/core
-GPU_SRC_FEATURES = gpu/src/features
-GPU_SRC_IO = gpu/src/io
-GPU_INCLUDE = gpu/include
+#define MAX_KERNEL_WIDTH 71
 
-EXAMPLES = examples
-BUILD = build
-OUTPUT = output
-DATA_DIR ?= data/pitch/frames
+typedef struct  {
+  int width;
+  float data[MAX_KERNEL_WIDTH];
+}  ConvolutionKernel;
 
-# Create output directories
-$(shell mkdir -p $(BUILD) $(OUTPUT)/cpu/frames $(OUTPUT)/gpu/frames)
+/* Static kernels */
+static ConvolutionKernel gauss_kernel, gaussderiv_kernel;
 
-######################################################################
-# Flags
-######################################################################
-FLAG1 = 
-CPU_CFLAGS = $(FLAG1) -I$(CPU_INCLUDE) -O3
-GPU_CFLAGS = $(FLAG1) -I$(GPU_INCLUDE) -O1
-ACC_FLAGS = -acc -Minfo=accel -O3 -I$(GPU_INCLUDE) $(FLAG1) -fPIC
+/*********************************************************************
+ * _computeKernels - CPU only
+ *********************************************************************/
+static void _computeKernels(
+  float sigma,
+  ConvolutionKernel *gauss,
+  ConvolutionKernel *gaussderiv)
+{
+  const float factor = 0.01f;
+  int i;
 
-LIB = -L/usr/local/lib -L/usr/lib
+  assert(MAX_KERNEL_WIDTH % 2 == 1);
+  assert(sigma >= 0.0);
 
-######################################################################
-# Source Files
-######################################################################
-CPU_CORE_SRCS = $(CPU_SRC_CORE)/convolve.c \
-                $(CPU_SRC_CORE)/pyramid.c \
-                $(CPU_SRC_CORE)/klt.c \
-                $(CPU_SRC_CORE)/klt_util.c
+  {
+    const int hw = MAX_KERNEL_WIDTH / 2;
+    float max_gauss = 1.0f, max_gaussderiv = (float)(sigma*exp(-0.5f));
+	
+    for (i = -hw; i <= hw; i++) {
+      gauss->data[i+hw] = (float)exp(-i*i / (2*sigma*sigma));
+      gaussderiv->data[i+hw] = -i * gauss->data[i+hw];
+    }
 
-CPU_FEAT_SRCS = $(CPU_SRC_FEATURES)/selectGoodFeatures.c \
-                $(CPU_SRC_FEATURES)/storeFeatures.c \
-                $(CPU_SRC_FEATURES)/trackFeatures.c \
-                $(CPU_SRC_FEATURES)/writeFeatures.c
+    gauss->width = MAX_KERNEL_WIDTH;
+    for (i = -hw; fabs(gauss->data[i+hw] / max_gauss) < factor; 
+         i++, gauss->width -= 2);
+    gaussderiv->width = MAX_KERNEL_WIDTH;
+    for (i = -hw; fabs(gaussderiv->data[i+hw] / max_gaussderiv) < factor; 
+         i++, gaussderiv->width -= 2);
+    if (gauss->width == MAX_KERNEL_WIDTH || 
+        gaussderiv->width == MAX_KERNEL_WIDTH) {
+      fprintf(stderr, "ERROR: MAX_KERNEL_WIDTH %d is too small for sigma of %f\n",
+              MAX_KERNEL_WIDTH, sigma);
+      exit(1);
+    }
+  }
 
-CPU_IO_SRCS = $(CPU_SRC_IO)/error.c \
-              $(CPU_SRC_IO)/pnmio.c
+  for (i = 0; i < gauss->width; i++)
+    gauss->data[i] = gauss->data[i+(MAX_KERNEL_WIDTH-gauss->width)/2];
+  for (i = 0; i < gaussderiv->width; i++)
+    gaussderiv->data[i] = gaussderiv->data[i+(MAX_KERNEL_WIDTH-gaussderiv->width)/2];
 
-CPU_SRCS = $(CPU_CORE_SRCS) $(CPU_FEAT_SRCS) $(CPU_IO_SRCS)
-CPU_OBJS = $(patsubst %.c,$(BUILD)/cpu_%.o,$(notdir $(CPU_SRCS)))
+  {
+    const int hw = gaussderiv->width / 2;
+    float den;
+			
+    den = 0.0;
+    for (i = 0; i < gauss->width; i++) den += gauss->data[i];
+    for (i = 0; i < gauss->width; i++) gauss->data[i] /= den;
+    den = 0.0;
+    for (i = -hw; i <= hw; i++) den -= i*gaussderiv->data[i+hw];
+    for (i = -hw; i <= hw; i++) gaussderiv->data[i+hw] /= den;
+  }
+}
 
-# GPU/OpenACC sources (same structure)
-GPU_CORE_SRCS = $(GPU_SRC_CORE)/convolve.c \
-                $(GPU_SRC_CORE)/pyramid.c \
-                $(GPU_SRC_CORE)/klt.c \
-                $(GPU_SRC_CORE)/klt_util.c
+/*********************************************************************
+ * _KLTToFloatImage - OpenACC optimized
+ *********************************************************************/
+void _KLTToFloatImage(
+  KLT_PixelType *img,
+  int ncols, int nrows,
+  _KLT_FloatImage floatimg)
+{
+  int npix = ncols * nrows;
+  float *ptrfl = floatimg->data;
 
-GPU_FEAT_SRCS = $(GPU_SRC_FEATURES)/selectGoodFeatures.c \
-                $(GPU_SRC_FEATURES)/storeFeatures.c \
-                $(GPU_SRC_FEATURES)/trackFeatures.c \
-                $(GPU_SRC_FEATURES)/writeFeatures.c
+  assert(floatimg->ncols >= ncols);
+  assert(floatimg->nrows >= nrows);
 
-GPU_IO_SRCS = $(GPU_SRC_IO)/error.c \
-              $(GPU_SRC_IO)/pnmio.c
+  floatimg->ncols = ncols;
+  floatimg->nrows = nrows;
 
-GPU_SRCS = $(GPU_CORE_SRCS) $(GPU_FEAT_SRCS) $(GPU_IO_SRCS)
-GPU_OBJS = $(patsubst %.c,$(BUILD)/gpu_%.o,$(notdir $(GPU_SRCS)))
+  #pragma acc parallel loop gang vector vector_length(256) \
+          copyin(img[0:npix]) copyout(ptrfl[0:npix])
+  for (int i = 0; i < npix; i++) {
+    ptrfl[i] = (float)img[i];
+  }
+}
 
-######################################################################
-# Default Target
-######################################################################
-all: cpu acc
+void _KLTGetKernelWidths(
+  float sigma,
+  int *gauss_width,
+  int *gaussderiv_width)
+{
+  _computeKernels(sigma, &gauss_kernel, &gaussderiv_kernel);
+  *gauss_width = gauss_kernel.width;
+  *gaussderiv_width = gaussderiv_kernel.width;
+}
 
-######################################################################
-# CPU Build (Baseline - No OpenACC)
-######################################################################
+/*********************************************************************
+ * _convolveSeparate - PURE OpenACC separable convolution
+ * Single data region: copyin input, create tmp (stays on GPU), copyout result
+ *********************************************************************/
+static void _convolveSeparate(
+  _KLT_FloatImage imgin,
+  ConvolutionKernel horiz_kernel,
+  ConvolutionKernel vert_kernel,
+  _KLT_FloatImage imgout)
+{
+  int ncols = imgin->ncols;
+  int nrows = imgin->nrows;
+  int npix = ncols * nrows;
+  
+  float *in_data = imgin->data;
+  float *out_data = imgout->data;
+  
+  // Allocate temporary buffer on host
+  float *tmp_data = (float*)malloc(npix * sizeof(float));
+  
+  // Reverse kernels (match CUDA logic)
+  int h_kwidth = horiz_kernel.width;
+  int h_radius = h_kwidth / 2;
+  float h_kernel_rev[MAX_KERNEL_WIDTH];
+  for (int k = 0; k < h_kwidth; k++) {
+    h_kernel_rev[k] = horiz_kernel.data[h_kwidth - 1 - k];
+  }
+  
+  int v_kwidth = vert_kernel.width;
+  int v_radius = v_kwidth / 2;
+  float v_kernel_rev[MAX_KERNEL_WIDTH];
+  for (int k = 0; k < v_kwidth; k++) {
+    v_kernel_rev[k] = vert_kernel.data[v_kwidth - 1 - k];
+  }
+  
+  // ============ SINGLE DATA REGION FOR ENTIRE SEPARABLE CONVOLUTION ============
+  // copyin: input image + kernels
+  // create: temporary buffer (stays on GPU between passes)
+  // copyout: final output image
+  #pragma acc data copyin(in_data[0:npix], h_kernel_rev[0:h_kwidth], v_kernel_rev[0:v_kwidth]) \
+                   create(tmp_data[0:npix]) \
+                   copyout(out_data[0:npix])
+  {
+    // ============ HORIZONTAL PASS: in_data -> tmp_data ============
+    #pragma acc parallel loop gang worker vector_length(256) collapse(2)
+    for (int j = 0; j < nrows; j++) {
+      for (int i = 0; i < ncols; i++) {
+        int idx = j * ncols + i;
+        
+        if (i < h_radius || i >= ncols - h_radius) {
+          tmp_data[idx] = 0.0f;
+        } else {
+          float sum = 0.0f;
+          int base = j * ncols + i - h_radius;
+          
+          #pragma acc loop seq
+          for (int k = 0; k < h_kwidth; k++) {
+            sum += in_data[base + k] * h_kernel_rev[k];
+          }
+          tmp_data[idx] = sum;
+        }
+      }
+    }
+    
+    // ============ VERTICAL PASS: tmp_data -> out_data ============
+    #pragma acc parallel loop gang worker vector_length(256) collapse(2)
+    for (int j = 0; j < nrows; j++) {
+      for (int i = 0; i < ncols; i++) {
+        int idx = j * ncols + i;
+        
+        if (j < v_radius || j >= nrows - v_radius) {
+          out_data[idx] = 0.0f;
+        } else {
+          float sum = 0.0f;
+          int base = (j - v_radius) * ncols + i;
+          
+          #pragma acc loop seq
+          for (int k = 0; k < v_kwidth; k++) {
+            sum += tmp_data[base + k * ncols] * v_kernel_rev[k];
+          }
+          out_data[idx] = sum;
+        }
+      }
+    }
+  } // Data region ends - automatic copyout of out_data
+  
+  free(tmp_data);
+  
+  imgout->ncols = ncols;
+  imgout->nrows = nrows;
+}
+	
+/*********************************************************************
+ * _KLTComputeGradients - PURE OpenACC (no double copies)
+ *********************************************************************/
+void _KLTComputeGradients(
+  _KLT_FloatImage img,
+  float sigma,
+  _KLT_FloatImage gradx,
+  _KLT_FloatImage grady)
+{
+  /* Compute kernels */
+    _computeKernels(sigma, &gauss_kernel, &gaussderiv_kernel);
+	
+  int ncols = img->ncols;
+  int nrows = img->nrows;
+  int npix = ncols * nrows;
+  
+  float *img_data = img->data;
+  float *gradx_data = gradx->data;
+  float *grady_data = grady->data;
+  
+  // Allocate temporary buffers
+  float *tmp1 = (float*)malloc(npix * sizeof(float));
+  float *tmp2 = (float*)malloc(npix * sizeof(float));
+  
+  // Reverse kernels
+  int gd_kwidth = gaussderiv_kernel.width;
+  int gd_radius = gd_kwidth / 2;
+  int g_kwidth = gauss_kernel.width;
+  int g_radius = g_kwidth / 2;
+  
+  float gauss_rev[MAX_KERNEL_WIDTH], gaussderiv_rev[MAX_KERNEL_WIDTH];
+  for (int k = 0; k < g_kwidth; k++) {
+    gauss_rev[k] = gauss_kernel.data[g_kwidth - 1 - k];
+  }
+  for (int k = 0; k < gd_kwidth; k++) {
+    gaussderiv_rev[k] = gaussderiv_kernel.data[gd_kwidth - 1 - k];
+  }
+  
+  // ============ COMPUTE GRADX: (gaussderiv_x * gauss_y) ============
+  #pragma acc data copyin(img_data[0:npix], gauss_rev[0:g_kwidth], gaussderiv_rev[0:gd_kwidth]) \
+                   create(tmp1[0:npix], tmp2[0:npix]) \
+                   copyout(gradx_data[0:npix])
+  {
+    // Horizontal pass with gaussderiv
+    #pragma acc parallel loop gang worker vector_length(256) collapse(2)
+    for (int j = 0; j < nrows; j++) {
+      for (int i = 0; i < ncols; i++) {
+        int idx = j * ncols + i;
+        if (i < gd_radius || i >= ncols - gd_radius) {
+          tmp1[idx] = 0.0f;
+        } else {
+          float sum = 0.0f;
+          int base = j * ncols + i - gd_radius;
+          #pragma acc loop seq
+          for (int k = 0; k < gd_kwidth; k++) {
+            sum += img_data[base + k] * gaussderiv_rev[k];
+          }
+          tmp1[idx] = sum;
+        }
+      }
+    }
+    
+    // Vertical pass with gauss
+    #pragma acc parallel loop gang worker vector_length(256) collapse(2)
+    for (int j = 0; j < nrows; j++) {
+      for (int i = 0; i < ncols; i++) {
+        int idx = j * ncols + i;
+        if (j < g_radius || j >= nrows - g_radius) {
+          gradx_data[idx] = 0.0f;
+        } else {
+          float sum = 0.0f;
+          int base = (j - g_radius) * ncols + i;
+          #pragma acc loop seq
+          for (int k = 0; k < g_kwidth; k++) {
+            sum += tmp1[base + k * ncols] * gauss_rev[k];
+          }
+          gradx_data[idx] = sum;
+        }
+      }
+    }
+  }
+  
+  // ============ COMPUTE GRADY: (gauss_x * gaussderiv_y) ============
+  #pragma acc data copyin(img_data[0:npix], gauss_rev[0:g_kwidth], gaussderiv_rev[0:gd_kwidth]) \
+                   create(tmp1[0:npix], tmp2[0:npix]) \
+                   copyout(grady_data[0:npix])
+  {
+    // Horizontal pass with gauss
+    #pragma acc parallel loop gang worker vector_length(256) collapse(2)
+    for (int j = 0; j < nrows; j++) {
+      for (int i = 0; i < ncols; i++) {
+        int idx = j * ncols + i;
+        if (i < g_radius || i >= ncols - g_radius) {
+          tmp1[idx] = 0.0f;
+        } else {
+          float sum = 0.0f;
+          int base = j * ncols + i - g_radius;
+          #pragma acc loop seq
+          for (int k = 0; k < g_kwidth; k++) {
+            sum += img_data[base + k] * gauss_rev[k];
+          }
+          tmp1[idx] = sum;
+        }
+      }
+    }
+    
+    // Vertical pass with gaussderiv
+    #pragma acc parallel loop gang worker vector_length(256) collapse(2)
+    for (int j = 0; j < nrows; j++) {
+      for (int i = 0; i < ncols; i++) {
+        int idx = j * ncols + i;
+        if (j < gd_radius || j >= nrows - gd_radius) {
+          grady_data[idx] = 0.0f;
+        } else {
+          float sum = 0.0f;
+          int base = (j - gd_radius) * ncols + i;
+          #pragma acc loop seq
+          for (int k = 0; k < gd_kwidth; k++) {
+            sum += tmp1[base + k * ncols] * gaussderiv_rev[k];
+          }
+          grady_data[idx] = sum;
+        }
+      }
+    }
+  }
+  
+  free(tmp1);
+  free(tmp2);
+  
+  gradx->ncols = ncols;
+  gradx->nrows = nrows;
+  grady->ncols = ncols;
+  grady->nrows = nrows;
+}
 
-# Compile CPU object files
-$(BUILD)/cpu_convolve.o: $(CPU_SRC_CORE)/convolve.c
-	$(CC) -c $(CPU_CFLAGS) $< -o $@
+/*********************************************************************
+ * _KLTComputeSmoothedImage
+ *********************************************************************/
+void _KLTComputeSmoothedImage(
+  _KLT_FloatImage img,
+  float sigma,
+  _KLT_FloatImage smooth)
+{
+  /* Compute kernel */
+    _computeKernels(sigma, &gauss_kernel, &gaussderiv_kernel);
 
-$(BUILD)/cpu_pyramid.o: $(CPU_SRC_CORE)/pyramid.c
-	$(CC) -c $(CPU_CFLAGS) $< -o $@
+  /* Do convolution */
+  _convolveSeparate(img, gauss_kernel, gauss_kernel, smooth);
+}
 
-$(BUILD)/cpu_klt.o: $(CPU_SRC_CORE)/klt.c
-	$(CC) -c $(CPU_CFLAGS) $< -o $@
-
-$(BUILD)/cpu_klt_util.o: $(CPU_SRC_CORE)/klt_util.c
-	$(CC) -c $(CPU_CFLAGS) $< -o $@
-
-$(BUILD)/cpu_selectGoodFeatures.o: $(CPU_SRC_FEATURES)/selectGoodFeatures.c
-	$(CC) -c $(CPU_CFLAGS) $< -o $@
-
-$(BUILD)/cpu_storeFeatures.o: $(CPU_SRC_FEATURES)/storeFeatures.c
-	$(CC) -c $(CPU_CFLAGS) $< -o $@
-
-$(BUILD)/cpu_trackFeatures.o: $(CPU_SRC_FEATURES)/trackFeatures.c
-	$(CC) -c $(CPU_CFLAGS) $< -o $@
-
-$(BUILD)/cpu_writeFeatures.o: $(CPU_SRC_FEATURES)/writeFeatures.c
-	$(CC) -c $(CPU_CFLAGS) $< -o $@
-
-$(BUILD)/cpu_error.o: $(CPU_SRC_IO)/error.c
-	$(CC) -c $(CPU_CFLAGS) $< -o $@
-
-$(BUILD)/cpu_pnmio.o: $(CPU_SRC_IO)/pnmio.c
-	$(CC) -c $(CPU_CFLAGS) $< -o $@
-
-# CPU library
-libklt_cpu.a: $(CPU_OBJS)
-	@rm -f $@
-	ar ruv $@ $(CPU_OBJS)
-	@echo "✅ CPU Library built: libklt_cpu.a"
-
-# CPU executable
-main_cpu: libklt_cpu.a $(EXAMPLES)/main_cpu.c
-	$(CC) $(CPU_CFLAGS) -DDATA_DIR='"$(DATA_DIR)/"' -DOUTPUT_DIR='"$(OUTPUT)/cpu/frames/"' \
-		-o $@ $(EXAMPLES)/main_cpu.c -L. -lklt_cpu $(LIB) -lm
-	@echo "✅ CPU executable built: main_cpu"
-
-cpu: main_cpu
-
-######################################################################
-# GPU Build (OpenACC with NVC)
-######################################################################
-
-# Compile GPU object files with OpenACC
-$(BUILD)/gpu_convolve.o: $(GPU_SRC_CORE)/convolve.c
-	$(NVC) -c $(ACC_FLAGS) $< -o $@
-
-$(BUILD)/gpu_pyramid.o: $(GPU_SRC_CORE)/pyramid.c
-	$(NVC) -c $(GPU_CFLAGS) $< -o $@
-
-$(BUILD)/gpu_klt.o: $(GPU_SRC_CORE)/klt.c
-	$(NVC) -c $(GPU_CFLAGS) $< -o $@
-
-$(BUILD)/gpu_klt_util.o: $(GPU_SRC_CORE)/klt_util.c
-	$(NVC) -c $(GPU_CFLAGS) $< -o $@
-
-$(BUILD)/gpu_selectGoodFeatures.o: $(GPU_SRC_FEATURES)/selectGoodFeatures.c
-	$(NVC) -c $(ACC_FLAGS) $< -o $@
-
-$(BUILD)/gpu_storeFeatures.o: $(GPU_SRC_FEATURES)/storeFeatures.c
-	$(NVC) -c -O1 -Igpu/include $< -o $@
-
-$(BUILD)/gpu_trackFeatures.o: $(GPU_SRC_FEATURES)/trackFeatures.c
-	$(NVC) -c -O1 -Igpu/include $< -o $@
-
-$(BUILD)/gpu_writeFeatures.o: $(GPU_SRC_FEATURES)/writeFeatures.c
-	$(NVC) -c -O1 -Igpu/include $< -o $@
-
-$(BUILD)/gpu_error.o: $(GPU_SRC_IO)/error.c
-	$(NVC) -c -O1 -Igpu/include $< -o $@
-
-$(BUILD)/gpu_pnmio.o: $(GPU_SRC_IO)/pnmio.c
-	$(NVC) -c -O1 -Igpu/include $< -o $@
-
-# GPU library
-libklt_gpu.a: $(GPU_OBJS)
-	@rm -f $@
-	ar ruv $@ $(GPU_OBJS)
-	@echo "✅ GPU Library built: libklt_gpu.a"
-
-# GPU executable - use NVC for linking to get OpenACC runtime
-main_gpu: libklt_gpu.a $(EXAMPLES)/main_gpu.c
-	$(NVC) -acc -O3 -Igpu/include -DDATA_DIR='"$(DATA_DIR)/"' -DOUTPUT_DIR='"$(OUTPUT)/gpu/frames/"' \
-		-o $@ $(EXAMPLES)/main_gpu.c -L. -lklt_gpu $(LIB) -lm
-	@echo "✅ GPU executable built: main_gpu"
-
-acc: main_gpu
-gpu: main_gpu
-
-######################################################################
-# Run Targets with Timing
-######################################################################
-run_cpu: cpu
-	@echo "🚀 Running CPU version..."
-	@./main_cpu
-
-run_gpu: acc
-	@echo "🚀 Running GPU version..."
-	@./main_gpu
-
-run_acc: run_gpu
-
-# Timing with comparison
-time_cpu: cpu
-	@echo "⏱️  Timing CPU version..."
-	@/usr/bin/time -f "CPU Time: %E (elapsed) %U (user) %S (sys)" ./main_cpu
-
-time_gpu: acc
-	@echo "⏱️  Timing GPU version..."
-	@/usr/bin/time -f "GPU Time: %E (elapsed) %U (user) %S (sys)" ./main_gpu
-
-time_acc: time_gpu
-
-# Run both and compare
-compare: cpu acc
-	@echo "========================================="
-	@echo "🔥 Performance Comparison"
-	@echo "========================================="
-	@echo ""
-	@echo "Running CPU version..."
-	@/usr/bin/time -f "CPU Time: %E" ./main_cpu 2>&1 | grep "CPU Time:"
-	@echo ""
-	@echo "Running GPU version..."
-	@/usr/bin/time -f "GPU Time: %E" ./main_gpu 2>&1 | grep "GPU Time:"
-	@echo ""
-	@echo "========================================="
-
-######################################################################
-# Clean
-######################################################################
-clean:
-	rm -f $(BUILD)/*.o *.a main_cpu main_gpu
-	rm -f $(OUTPUT)/cpu/frames/*.ppm $(OUTPUT)/gpu/frames/*.ppm
-	rm -f $(OUTPUT)/cpu/frames/*.txt $(OUTPUT)/gpu/frames/*.txt
-	@echo "✅ Cleaned build artifacts"
-
-clean-all: clean
-	rm -rf $(BUILD) $(OUTPUT)
-	@echo "✅ Cleaned everything"
-
-######################################################################
-# Help
-######################################################################
-help:
-	@echo "Available targets:"
-	@echo "  make cpu        - Build CPU version (baseline)"
-	@echo "  make acc/gpu    - Build GPU version with OpenACC"
-	@echo "  make all        - Build both CPU and GPU versions"
-	@echo ""
-	@echo "  make run_cpu    - Run CPU version"
-	@echo "  make run_gpu    - Run GPU version"
-	@echo ""
-	@echo "  make time_cpu   - Time CPU version"
-	@echo "  make time_gpu   - Time GPU version"
-	@echo "  make compare    - Run both and compare times"
-	@echo ""
-	@echo "  make clean      - Clean build artifacts"
-	@echo "  make clean-all  - Clean everything including output"
-
-.PHONY: all cpu acc gpu run_cpu run_gpu run_acc time_cpu time_gpu time_acc compare clean clean-all help
+/*********************************************************************
+ * Cleanup function - no persistent buffers in pure OpenACC version
+ *********************************************************************/
+void _KLTCleanupGPU() {
+  // Pure OpenACC version manages memory automatically via data regions
+  // No manual cleanup needed
+}
