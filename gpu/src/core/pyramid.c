@@ -115,13 +115,19 @@ void _KLTComputePyramid(
 
 
     /* Subsample */
-    oldncols = ncols;
-    ncols /= subsampling;  nrows /= subsampling;
-    for (y = 0 ; y < nrows ; y++)
-      for (x = 0 ; x < ncols ; x++)
-        pyramid->img[i]->data[y*ncols+x] = 
-          tmpimg->data[(subsampling*y+subhalf)*oldncols +
-                      (subsampling*x+subhalf)];
+      int oldN = oldncols * (nrows * subsampling); // but simplest: oldN = tmpimg->ncols * tmpimg->nrows;
+      int newN = ncols * nrows;
+
+      #pragma acc parallel loop collapse(2) \
+        copyin(tmpimg->data[0:oldN]) \
+        copyout(pyramid->img[i]->data[0:newN])
+      for (y = 0 ; y < nrows ; y++) {
+        for (x = 0 ; x < ncols ; x++) {
+          pyramid->img[i]->data[y*ncols + x] =
+            tmpimg->data[(subsampling*y + subhalf)*oldncols +
+                        (subsampling*x + subhalf)];
+        }
+      }
 
     /* Reassign current image */
     currimg = pyramid->img[i];
@@ -130,13 +136,6 @@ void _KLTComputePyramid(
   }
 }
  
-
-
-
-
-
-
-
 
 
 
