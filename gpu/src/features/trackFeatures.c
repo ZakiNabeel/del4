@@ -28,7 +28,6 @@ typedef float *_FloatWindow;
  * gray-level value of the point in the image.  
  */
 
-#pragma acc routine seq
 static float _interpolate(
   float x, 
   float y, 
@@ -67,28 +66,24 @@ static float _interpolate(
  */
 
 static void _computeIntensityDifference(
-  _KLT_FloatImage img1, _KLT_FloatImage img2,
-  float x1, float y1,
-  float x2, float y2,
-  int width, int height,
-  _FloatWindow imgdiff)
+  _KLT_FloatImage img1,   /* images */
+  _KLT_FloatImage img2,
+  float x1, float y1,     /* center of window in 1st img */
+  float x2, float y2,     /* center of window in 2nd img */
+  int width, int height,  /* size of window */
+  _FloatWindow imgdiff)   /* output */
 {
-  int hw = width / 2, hh = height / 2;
-  int W = width, H = height;
+  register int hw = width/2, hh = height/2;
+  float g1, g2;
+  register int i, j;
 
-  #pragma acc parallel loop collapse(2) \
-    present(img1->data[0:img1->ncols*img1->nrows], \
-            img2->data[0:img2->ncols*img2->nrows]) \
-    copyout(imgdiff[0:W*H])
-  for (int j = -hh; j <= hh; ++j) {
-    for (int i = -hw; i <= hw; ++i) {
-      float g1 = _interpolate(x1 + i, y1 + j, img1);
-      float g2 = _interpolate(x2 + i, y2 + j, img2);
-      int jj = j + hh;
-      int ii = i + hw;
-      imgdiff[jj * W + ii] = g1 - g2;
+  /* Compute values */
+  for (j = -hh ; j <= hh ; j++)
+    for (i = -hw ; i <= hw ; i++)  {
+      g1 = _interpolate(x1+i, y1+j, img1);
+      g2 = _interpolate(x2+i, y2+j, img2);
+      *imgdiff++ = g1 - g2;
     }
-  }
 }
 
 
@@ -1532,3 +1527,5 @@ void KLTTrackFeatures(
 	}
 
 }
+
+
