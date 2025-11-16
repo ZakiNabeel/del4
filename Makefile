@@ -1,171 +1,248 @@
 ######################################################################
-# Choose your favorite C compiler
+# Makefile for Del4 - OpenACC Optimization Project
+######################################################################
+
+# Compilers
 CC = gcc
-
-######################################################################
-# -DNDEBUG prevents the assert() statements from being included in 
-# the code.  If you are having problems running the code, you might 
-# want to comment this line to see if an assert() statement fires.
-FLAG1 = -DNDEBUG
-
-######################################################################
-# -DKLT_USE_QSORT forces the code to use the standard qsort() 
-# routine.  Otherwise it will use a quicksort routine that takes
-# advantage of our specific data structure to greatly reduce the
-# running time on some machines.  Uncomment this line if for some
-# reason you are unhappy with the special routine.
-# FLAG2 = -DKLT_USE_QSORT
-
-######################################################################
-# Add your favorite C flags here.
-CFLAGS = $(FLAG1) $(FLAG2)
-
-
-######################################################################
-# There should be no need to modify anything below this line (but
-# feel free to if you want).
-
-EXAMPLES = example1.c example2.c example3.c example4.c example5.c
-ARCH = convolve.c error.c pnmio.c pyramid.c selectGoodFeatures.c \
-       storeFeatures.c trackFeatures.c klt.c klt_util.c writeFeatures.c
-LIB = -L/usr/local/lib -L/usr/lib
-
-.SUFFIXES:  .c .o
-
-all:  lib $(EXAMPLES:.c=)
-
-.c.o:
-	$(CC) -c $(CFLAGS) $<
-
-lib: $(ARCH:.c=.o)
-	rm -f libklt.a
-	ar ruv libklt.a $(ARCH:.c=.o)
-	rm -f *.o
-
-example1: libklt.a
-	$(CC) -O3 $(CFLAGS) -o $@ $@.c -L. -lklt $(LIB) -lm
-
-example2: libklt.a
-	$(CC) -O3 $(CFLAGS) -o $@ $@.c -L. -lklt $(LIB) -lm
-
-example3: libklt.a
-	$(CC) -O3 $(CFLAGS) -o $@ $@.c -L. -lklt $(LIB) -lm
-
-example4: libklt.a
-	$(CC) -O3 $(CFLAGS) -o $@ $@.c -L. -lklt $(LIB) -lm
-
-example5: libklt.a
-	$(CC) -O3 $(CFLAGS) -o $@ $@.c -L. -lklt $(LIB) -lm
-
-depend:
-	makedepend $(ARCH) $(EXAMPLES)
-
-clean:
-	rm -f *.o *.a $(EXAMPLES:.c=) *.tar *.tar.gz libklt.a \
-	      feat*.ppm features.ft features.txt
-
-######################################################################
-# CUDA (optional) — appended section; original targets unchanged
-
-# Toolchains
-NVCC       ?= nvcc
-CXX        ?= g++
-# Set your architecture if you know it (e.g., sm_86 for RTX 30xx, sm_80 for A100)
-# Build for a set of common architectures (P100, V100, T4, A100, RTX30, L4)
-CUDAARCHES ?= 60 70 75 80 86 89
-GENCODES   := $(foreach a,$(CUDAARCHES),-gencode arch=compute_$(a),code=sm_$(a))
-
-CUDAFLAGS  ?= -O3 -Xcompiler -fPIC -I. -I./cuda $(GENCODES)
-
-
-# Flags
-CUDAFLAGS  ?= -O3 -arch=$(CUDAARCH) -Xcompiler -fPIC -I. -I./cuda
-CUDALIBS   ?= -lcudart
-# You can add -DUSE_CUDA here or in your compile line below
-CXXFLAGS   ?=
-
-# CUDA sources (create these files as you implement the GPU path)
-# CUDA sources
-CUDA_SRCS  := cuda/pyramid_cuda.cu \
-              cuda/gradients_cuda.cu \
-              cuda/track_cuda.cu \
-              cuda/example_cuda.cu
-
-CUDA_OBJS  := $(CUDA_SRCS:.cu=.o)
-
-cuda/%.o: cuda/%.cu
-	$(NVCC) $(CUDAFLAGS) -I. -I./cuda -c $< -o $@
-
-$(CUDA_LIB): $(CUDA_OBJS)
-	@rm -f $@
-	ar rcs $@ $(CUDA_OBJS)
-
-
-CUDA_LIB   := libklt_cuda.a
-
-# Build CUDA objects
-cuda/%.o: cuda/%.cu cuda/klt_cuda.h
-	$(NVCC) $(CUDAFLAGS) -c $< -o $@
-
-# Pack CUDA objects into a static lib (like your CPU libklt.a)
-$(CUDA_LIB): $(CUDA_OBJS)
-	@rm -f $@
-	ar rcs $@ $(CUDA_OBJS)
-
-# Unified runner that can call CPU examples or the CUDA path (uses main.cpp)
-# Build with USE_CUDA so the GPU code paths are compiled in.
-# GPU-only runner that does NOT link example1..5 (avoids multiple mains)
-klt_runner: libklt.a $(CUDA_LIB) main_gpu.cpp
-	$(NVCC) $(CUDAFLAGS) -DUSE_CUDA -o $@ main_gpu.cpp \
-		-L. -lklt -lklt_cuda $(LIB) -lcudart
-
-
-# Convenience alias to build the GPU runner
-gpu: klt_runner
-
-# Extend clean to remove CUDA artifacts (keeps existing 'clean' behavior intact)
-.PHONY: clean-cuda
-clean-cuda:
-	rm -f $(CUDA_OBJS) $(CUDA_LIB) klt_runner
-
-########################################################################
-# OpenACC Section (CPU vs GPU builds)
-########################################################################
-
-# Path to OpenACC compiler (NVHPC) – use from PATH by default
 NVC ?= nvc
 
-# Baseline CPU executable (OpenACC pragmas ignored)
-cpu: libklt.a example3_cpu
+# Directories
+CPU_SRC_CORE = cpu/src/core
+CPU_SRC_FEATURES = cpu/src/features
+CPU_SRC_IO = cpu/src/io
+CPU_INCLUDE = cpu/include
 
-example3_cpu: example3.c libklt.a
-	$(CC) -O3 $(CFLAGS) -o example3_cpu example3.c -L. -lklt $(LIB) -lm
+GPU_SRC_CORE = gpu/src/core
+GPU_SRC_FEATURES = gpu/src/features
+GPU_SRC_IO = gpu/src/io
+GPU_INCLUDE = gpu/include
 
-# OpenACC-accelerated executable
-acc: example3_acc
+EXAMPLES = examples
+BUILD = build
+OUTPUT = output
+DATA_DIR ?= data/pitch/frames
 
-example3_acc: example3.c $(ARCH)
-	$(NVC) -O3 -acc -Minfo=accel $(CFLAGS) \
-		-o example3_acc example3.c $(ARCH) $(LIB) -lm
+# Create output directories
+$(shell mkdir -p $(BUILD) $(OUTPUT)/cpu/frames $(OUTPUT)/gpu/frames)
 
-########################################################################
-# Timing helpers (simple, readable ms output)
-########################################################################
+######################################################################
+# Flags
+######################################################################
+FLAG1 = -DNDEBUG
+CPU_CFLAGS = $(FLAG1) -I$(CPU_INCLUDE) -O3
+GPU_CFLAGS = $(FLAG1) -I$(GPU_INCLUDE) -O3
+ACC_FLAGS = -acc -gpu=managed -Minfo=accel -O3 -I$(GPU_INCLUDE) $(FLAG1)
 
+LIB = -L/usr/local/lib -L/usr/lib
+
+######################################################################
+# Source Files
+######################################################################
+CPU_CORE_SRCS = $(CPU_SRC_CORE)/convolve.c \
+                $(CPU_SRC_CORE)/pyramid.c \
+                $(CPU_SRC_CORE)/klt.c \
+                $(CPU_SRC_CORE)/klt_util.c
+
+CPU_FEAT_SRCS = $(CPU_SRC_FEATURES)/selectGoodFeatures.c \
+                $(CPU_SRC_FEATURES)/storeFeatures.c \
+                $(CPU_SRC_FEATURES)/trackFeatures.c \
+                $(CPU_SRC_FEATURES)/writeFeatures.c
+
+CPU_IO_SRCS = $(CPU_SRC_IO)/error.c \
+              $(CPU_SRC_IO)/pnmio.c
+
+CPU_SRCS = $(CPU_CORE_SRCS) $(CPU_FEAT_SRCS) $(CPU_IO_SRCS)
+CPU_OBJS = $(patsubst %.c,$(BUILD)/cpu_%.o,$(notdir $(CPU_SRCS)))
+
+# GPU/OpenACC sources (same structure)
+GPU_CORE_SRCS = $(GPU_SRC_CORE)/convolve.c \
+                $(GPU_SRC_CORE)/pyramid.c \
+                $(GPU_SRC_CORE)/klt.c \
+                $(GPU_SRC_CORE)/klt_util.c
+
+GPU_FEAT_SRCS = $(GPU_SRC_FEATURES)/selectGoodFeatures.c \
+                $(GPU_SRC_FEATURES)/storeFeatures.c \
+                $(GPU_SRC_FEATURES)/trackFeatures.c \
+                $(GPU_SRC_FEATURES)/writeFeatures.c
+
+GPU_IO_SRCS = $(GPU_SRC_IO)/error.c \
+              $(GPU_SRC_IO)/pnmio.c
+
+GPU_SRCS = $(GPU_CORE_SRCS) $(GPU_FEAT_SRCS) $(GPU_IO_SRCS)
+GPU_OBJS = $(patsubst %.c,$(BUILD)/gpu_%.o,$(notdir $(GPU_SRCS)))
+
+######################################################################
+# Default Target
+######################################################################
+all: cpu acc
+
+######################################################################
+# CPU Build (Baseline - No OpenACC)
+######################################################################
+
+# Compile CPU object files
+$(BUILD)/cpu_convolve.o: $(CPU_SRC_CORE)/convolve.c
+	$(CC) -c $(CPU_CFLAGS) $< -o $@
+
+$(BUILD)/cpu_pyramid.o: $(CPU_SRC_CORE)/pyramid.c
+	$(CC) -c $(CPU_CFLAGS) $< -o $@
+
+$(BUILD)/cpu_klt.o: $(CPU_SRC_CORE)/klt.c
+	$(CC) -c $(CPU_CFLAGS) $< -o $@
+
+$(BUILD)/cpu_klt_util.o: $(CPU_SRC_CORE)/klt_util.c
+	$(CC) -c $(CPU_CFLAGS) $< -o $@
+
+$(BUILD)/cpu_selectGoodFeatures.o: $(CPU_SRC_FEATURES)/selectGoodFeatures.c
+	$(CC) -c $(CPU_CFLAGS) $< -o $@
+
+$(BUILD)/cpu_storeFeatures.o: $(CPU_SRC_FEATURES)/storeFeatures.c
+	$(CC) -c $(CPU_CFLAGS) $< -o $@
+
+$(BUILD)/cpu_trackFeatures.o: $(CPU_SRC_FEATURES)/trackFeatures.c
+	$(CC) -c $(CPU_CFLAGS) $< -o $@
+
+$(BUILD)/cpu_writeFeatures.o: $(CPU_SRC_FEATURES)/writeFeatures.c
+	$(CC) -c $(CPU_CFLAGS) $< -o $@
+
+$(BUILD)/cpu_error.o: $(CPU_SRC_IO)/error.c
+	$(CC) -c $(CPU_CFLAGS) $< -o $@
+
+$(BUILD)/cpu_pnmio.o: $(CPU_SRC_IO)/pnmio.c
+	$(CC) -c $(CPU_CFLAGS) $< -o $@
+
+# CPU library
+libklt_cpu.a: $(CPU_OBJS)
+	@rm -f $@
+	ar ruv $@ $(CPU_OBJS)
+	@echo "✅ CPU Library built: libklt_cpu.a"
+
+# CPU executable
+main_cpu: libklt_cpu.a $(EXAMPLES)/main_cpu.c
+	$(CC) $(CPU_CFLAGS) -DDATA_DIR='"$(DATA_DIR)/"' -DOUTPUT_DIR='"$(OUTPUT)/cpu/frames/"' \
+		-o $@ $(EXAMPLES)/main_cpu.c -L. -lklt_cpu $(LIB) -lm
+	@echo "✅ CPU executable built: main_cpu"
+
+cpu: main_cpu
+
+######################################################################
+# GPU Build (OpenACC with NVC)
+######################################################################
+
+# Compile GPU object files with OpenACC
+$(BUILD)/gpu_convolve.o: $(GPU_SRC_CORE)/convolve.c
+	$(NVC) -c $(ACC_FLAGS) $< -o $@
+
+$(BUILD)/gpu_pyramid.o: $(GPU_SRC_CORE)/pyramid.c
+	$(NVC) -c $(GPU_CFLAGS) $< -o $@
+
+$(BUILD)/gpu_klt.o: $(GPU_SRC_CORE)/klt.c
+	$(NVC) -c $(GPU_CFLAGS) $< -o $@
+
+$(BUILD)/gpu_klt_util.o: $(GPU_SRC_CORE)/klt_util.c
+	$(NVC) -c $(GPU_CFLAGS) $< -o $@
+
+$(BUILD)/gpu_selectGoodFeatures.o: $(GPU_SRC_FEATURES)/selectGoodFeatures.c
+	$(NVC) -c $(GPU_CFLAGS) $< -o $@
+
+$(BUILD)/gpu_storeFeatures.o: $(GPU_SRC_FEATURES)/storeFeatures.c
+	$(NVC) -c $(GPU_CFLAGS) $< -o $@
+
+$(BUILD)/gpu_trackFeatures.o: $(GPU_SRC_FEATURES)/trackFeatures.c
+	$(NVC) -c $(GPU_CFLAGS) $< -o $@
+
+$(BUILD)/gpu_writeFeatures.o: $(GPU_SRC_FEATURES)/writeFeatures.c
+	$(NVC) -c $(GPU_CFLAGS) $< -o $@
+
+$(BUILD)/gpu_error.o: $(GPU_SRC_IO)/error.c
+	$(NVC) -c $(GPU_CFLAGS) $< -o $@
+
+$(BUILD)/gpu_pnmio.o: $(GPU_SRC_IO)/pnmio.c
+	$(NVC) -c $(GPU_CFLAGS) $< -o $@
+
+# GPU library
+libklt_gpu.a: $(GPU_OBJS)
+	@rm -f $@
+	ar ruv $@ $(GPU_OBJS)
+	@echo "✅ GPU Library built: libklt_gpu.a"
+
+# GPU executable
+main_gpu: libklt_gpu.a $(EXAMPLES)/main_gpu.c
+	$(NVC) $(ACC_FLAGS) -DDATA_DIR='"$(DATA_DIR)/"' -DOUTPUT_DIR='"$(OUTPUT)/gpu/frames/"' \
+		-o $@ $(EXAMPLES)/main_gpu.c -L. -lklt_gpu $(LIB) -lm
+	@echo "✅ GPU executable built: main_gpu"
+
+acc: main_gpu
+gpu: main_gpu
+
+######################################################################
+# Run Targets with Timing
+######################################################################
+run_cpu: cpu
+	@echo "🚀 Running CPU version..."
+	@./main_cpu
+
+run_gpu: acc
+	@echo "🚀 Running GPU version..."
+	@./main_gpu
+
+run_acc: run_gpu
+
+# Timing with comparison
 time_cpu: cpu
-	@echo "Running CPU version..."
-	@start=$$(date +%s%N); \
-	./example3_cpu; \
-	end=$$(date +%s%N); \
-	delta_ns=$$((end-start)); \
-	ms=$$((delta_ns/1000000)); \
-	echo "CPU time: $$ms ms"
+	@echo "⏱️  Timing CPU version..."
+	@/usr/bin/time -f "CPU Time: %E (elapsed) %U (user) %S (sys)" ./main_cpu
 
-time_acc: acc
-	@echo "Running OpenACC version..."
-	@start=$$(date +%s%N); \
-	./example3_acc; \
-	end=$$(date +%s%N); \
-	delta_ns=$$((end-start)); \
-	ms=$$((delta_ns/1000000)); \
-	echo "ACC time: $$ms ms"
+time_gpu: acc
+	@echo "⏱️  Timing GPU version..."
+	@/usr/bin/time -f "GPU Time: %E (elapsed) %U (user) %S (sys)" ./main_gpu
+
+time_acc: time_gpu
+
+# Run both and compare
+compare: cpu acc
+	@echo "========================================="
+	@echo "🔥 Performance Comparison"
+	@echo "========================================="
+	@echo ""
+	@echo "Running CPU version..."
+	@/usr/bin/time -f "CPU Time: %E" ./main_cpu 2>&1 | grep "CPU Time:"
+	@echo ""
+	@echo "Running GPU version..."
+	@/usr/bin/time -f "GPU Time: %E" ./main_gpu 2>&1 | grep "GPU Time:"
+	@echo ""
+	@echo "========================================="
+
+######################################################################
+# Clean
+######################################################################
+clean:
+	rm -f $(BUILD)/*.o *.a main_cpu main_gpu
+	rm -f $(OUTPUT)/cpu/frames/*.ppm $(OUTPUT)/gpu/frames/*.ppm
+	rm -f $(OUTPUT)/cpu/frames/*.txt $(OUTPUT)/gpu/frames/*.txt
+	@echo "✅ Cleaned build artifacts"
+
+clean-all: clean
+	rm -rf $(BUILD) $(OUTPUT)
+	@echo "✅ Cleaned everything"
+
+######################################################################
+# Help
+######################################################################
+help:
+	@echo "Available targets:"
+	@echo "  make cpu        - Build CPU version (baseline)"
+	@echo "  make acc/gpu    - Build GPU version with OpenACC"
+	@echo "  make all        - Build both CPU and GPU versions"
+	@echo ""
+	@echo "  make run_cpu    - Run CPU version"
+	@echo "  make run_gpu    - Run GPU version"
+	@echo ""
+	@echo "  make time_cpu   - Time CPU version"
+	@echo "  make time_gpu   - Time GPU version"
+	@echo "  make compare    - Run both and compare times"
+	@echo ""
+	@echo "  make clean      - Clean build artifacts"
+	@echo "  make clean-all  - Clean everything including output"
+
+.PHONY: all cpu acc gpu run_cpu run_gpu run_acc time_cpu time_gpu time_acc compare clean clean-all help
