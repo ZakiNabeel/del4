@@ -19,7 +19,7 @@
 #include "klt_util.h"
 #include "pyramid.h"
 
-int KLT_verbose = 0;
+int KLT_verbose = 1;
 
 typedef enum {SELECTING_ALL, REPLACING_SOME} selectionMode;
 
@@ -392,35 +392,29 @@ void _KLTSelectGoodFeatures(
     limit = limit/2 - 1;
 		
     /* For most of the pixels in the image, do ... */
-    ptr = pointlist;
-    for (y = bordery ; y < nrows - bordery ; y += tc->nSkippedPixels + 1)
-      for (x = borderx ; x < ncols - borderx ; x += tc->nSkippedPixels + 1)  {
+    int npix = ncols * nrows;
+    float *score = malloc(npix * sizeof(float));
 
-        /* Sum the gradients in the surrounding window */
-        gxx = 0;  gxy = 0;  gyy = 0;
-        for (yy = y-window_hh ; yy <= y+window_hh ; yy++)
-          for (xx = x-window_hw ; xx <= x+window_hw ; xx++)  {
-            gx = *(gradx->data + ncols*yy+xx);
-            gy = *(grady->data + ncols*yy+xx);
+    #pragma acc parallel loop collapse(2) \
+        present(gradx->data[0:npix], grady->data[0:npix]) \
+        copyout(score[0:npix])
+    int step = tc->nSkippedPixels + 1;
+    for (int y = bordery; y < nrows - bordery; y += step) {
+      for (int x = borderx; x < ncols - borderx; x += step) {
+        float gxx = 0, gxy = 0, gyy = 0;
+        for (int yy = y-window_hh; yy <= y+window_hh; ++yy)
+          for (int xx = x-window_hw; xx <= x+window_hw; ++xx) {
+            float gx = gradx->data[ncols*yy + xx];
+            float gy = grady->data[ncols*yy + xx];
             gxx += gx * gx;
             gxy += gx * gy;
             gyy += gy * gy;
           }
-
-        /* Store the trackability of the pixel as the minimum
-           of the two eigenvalues */
-        *ptr++ = x;
-        *ptr++ = y;
-        val = _minEigenvalue(gxx, gxy, gyy);
-        if (val > limit)  {
-          KLTWarning("(_KLTSelectGoodFeatures) minimum eigenvalue %f is "
-                     "greater than the capacity of an int; setting "
-                     "to maximum value", val);
-          val = (float) limit;
-        }
-        *ptr++ = (int) val;
-        npoints++;
+        int idx = y * ncols + x;
+        score[idx] = _minEigenvalue(gxx, gxy, gyy);
       }
+    }
+
   }
 			
   /* Sort the features  */
@@ -539,5 +533,4 @@ void KLTReplaceLostFeatures(
     fflush(stderr);
   }
 }
-
 
