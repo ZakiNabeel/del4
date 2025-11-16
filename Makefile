@@ -1,7 +1,10 @@
 ######################################################################
-# Compiler Setup
+# Compiler Setup - OpenACC Version
 CC      = gcc
-NVCC    = nvcc
+# OpenACC compiler (use nvc, pgcc, or gcc with -fopenacc)
+ACC_CC  = nvc
+# Fallback if nvc not available: gcc with -fopenacc
+# ACC_CC  = gcc
 
 ######################################################################
 # Directories
@@ -34,16 +37,16 @@ MAX_FRAMES     = 99999999
 
 ######################################################################
 # Flags
-# CUDA_ARCH: 75=T4(Turing), 86=RTX3080(Ampere), 89=RTX4090(Ada)
-CUDA_ARCH ?= 86             
-ARCH       = sm_$(CUDA_ARCH)
 FLAG1        = -DNDEBUG
-CPU_CFLAGS   = $(FLAG1) -I$(CPU_INCLUDE_DIR)
-GPU_CFLAGS   = $(FLAG1) -I$(GPU_INCLUDE_DIR)
-GPUFLAGS = -Xcompiler "-fPIC" -I$(GPU_INCLUDE_DIR) \
-           "-gencode=arch=compute_$(CUDA_ARCH),code=sm_$(CUDA_ARCH)" \
-           "-gencode=arch=compute_$(CUDA_ARCH),code=compute_$(CUDA_ARCH)" \
-           -O3
+CPU_CFLAGS   = $(FLAG1) -I$(CPU_INCLUDE_DIR) -O3
+
+# OpenACC flags for GPU code
+# For NVIDIA HPC SDK (nvc/pgcc):
+ACC_FLAGS    = -acc -gpu=managed -Minfo=accel -O3 -I$(GPU_INCLUDE_DIR) $(FLAG1)
+# For GCC with OpenACC support:
+# ACC_FLAGS    = -fopenacc -O3 -I$(GPU_INCLUDE_DIR) $(FLAG1)
+
+GPU_CFLAGS   = $(ACC_FLAGS)
 
 
 LIB          = -L/usr/local/lib -L/usr/lib
@@ -101,27 +104,27 @@ $(BUILD_DIR)/cpu_error.o: $(CPU_SRC_IO)/error.c
 $(BUILD_DIR)/cpu_pnmio.o: $(CPU_SRC_IO)/pnmio.c
 	$(CC) -c $(CPU_CFLAGS) $< -o $@
 
-# Compile object files - GPU
-$(BUILD_DIR)/gpu_convolve.o: $(GPU_SRC_CORE)/convolve.cu
-	$(NVCC) -c $(GPUFLAGS) $< -o $@
+# Compile object files - GPU (OpenACC)
+$(BUILD_DIR)/gpu_convolve.o: $(GPU_SRC_CORE)/convolve.c
+	$(ACC_CC) -c $(ACC_FLAGS) $< -o $@
 $(BUILD_DIR)/gpu_pyramid.o: $(GPU_SRC_CORE)/pyramid.c
-	$(CC) -c $(GPU_CFLAGS) $< -o $@
+	$(ACC_CC) -c $(GPU_CFLAGS) $< -o $@
 $(BUILD_DIR)/gpu_klt.o: $(GPU_SRC_CORE)/klt.c
-	$(CC) -c $(GPU_CFLAGS) $< -o $@
+	$(ACC_CC) -c $(GPU_CFLAGS) $< -o $@
 $(BUILD_DIR)/gpu_klt_util.o: $(GPU_SRC_CORE)/klt_util.c
-	$(CC) -c $(GPU_CFLAGS) $< -o $@
-$(BUILD_DIR)/gpu_selectGoodFeatures.o: $(GPU_SRC_FEATURES)/selectGoodFeatures_cuda.cu
-	$(NVCC) -c $(GPUFLAGS) $< -o $@
+	$(ACC_CC) -c $(GPU_CFLAGS) $< -o $@
+$(BUILD_DIR)/gpu_selectGoodFeatures.o: $(GPU_SRC_FEATURES)/selectGoodFeatures.c
+	$(ACC_CC) -c $(ACC_FLAGS) $< -o $@
 $(BUILD_DIR)/gpu_storeFeatures.o: $(GPU_SRC_FEATURES)/storeFeatures.c
-	$(CC) -c $(GPU_CFLAGS) $< -o $@
+	$(ACC_CC) -c $(GPU_CFLAGS) $< -o $@
 $(BUILD_DIR)/gpu_trackFeatures.o: $(GPU_SRC_FEATURES)/trackFeatures.c
-	$(CC) -c $(GPU_CFLAGS) $< -o $@
+	$(ACC_CC) -c $(ACC_FLAGS) $< -o $@
 $(BUILD_DIR)/gpu_writeFeatures.o: $(GPU_SRC_FEATURES)/writeFeatures.c
-	$(CC) -c $(GPU_CFLAGS) $< -o $@
+	$(ACC_CC) -c $(GPU_CFLAGS) $< -o $@
 $(BUILD_DIR)/gpu_error.o: $(GPU_SRC_IO)/error.c
-	$(CC) -c $(GPU_CFLAGS) $< -o $@
+	$(ACC_CC) -c $(GPU_CFLAGS) $< -o $@
 $(BUILD_DIR)/gpu_pnmio.o: $(GPU_SRC_IO)/pnmio.c
-	$(CC) -c $(GPU_CFLAGS) $< -o $@
+	$(ACC_CC) -c $(GPU_CFLAGS) $< -o $@
 
 ######################################################################
 # Build library
@@ -160,10 +163,10 @@ cpu: lib-cpu $(OUTPUT_CPU)
 	fi
 
 ######################################################################
-# GPU build & run
+# GPU build & run (OpenACC)
 gpu: lib-gpu $(OUTPUT_GPU)
-	@echo "Building GPU version..."
-	$(NVCC) -O3 $(GPUFLAGS) -DDATA_DIR='"$(DATA_DIR)/"' -DOUTPUT_DIR='"$(FRAMES_GPU)/"' \
+	@echo "Building GPU version with OpenACC..."
+	$(ACC_CC) $(ACC_FLAGS) -DDATA_DIR='"$(DATA_DIR)/"' -DOUTPUT_DIR='"$(FRAMES_GPU)/"' \
 		-DMAX_FRAMES=$(MAX_FRAMES) -DN_FEATURES=$(N_FEATURES) \
 		-o main_gpu $(EXAMPLES_DIR)/main_gpu.c -L. -lklt_gpu $(LIB) -lm
 	@echo "Running GPU version..."
